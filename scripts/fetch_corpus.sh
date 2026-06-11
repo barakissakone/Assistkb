@@ -23,10 +23,34 @@ mkdir -p "${RAW_DIR}/cert-fr" "${RAW_DIR}/cnil" "${RAW_DIR}/data-gouv"
 PROFILE="${PROFILE:-open}"
 N_AVIS="${N_AVIS:-30}"
 
-CURL=(curl -fSL --retry 3 --retry-delay 2 --connect-timeout 15 -A "tp-rag-formation/1.0")
+CURL=(curl -fSL --retry 3 --retry-delay 2 --connect-timeout 15 -A "Mozilla/5.0")
 
 log()  { printf '\033[0;36m[fetch]\033[0m %s\n' "$*"; }
 warn() { printf '\033[0;33m[warn ]\033[0m %s\n' "$*" >&2; }
+
+is_valid_file() {
+  local file="$1"
+  local ext="${file##*.}"
+
+  if [ ! -s "$file" ]; then
+    return 1
+  fi
+
+  case "$ext" in
+    pdf)
+      head -c 5 "$file" | grep -q "%PDF-"
+      ;;
+    json)
+      head -c 1 "$file" | grep -q '[{\[]'
+      ;;
+    csv|txt|html)
+      ! head -c 100 "$file" | grep -qi "<!doctype html"
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
 
 fetch_cert() {
   log "CERT-FR : recuperation du flux d'avis..."
@@ -47,9 +71,11 @@ fetch_cert() {
   for id in ${ids}; do
     local base="https://www.cert.ssi.gouv.fr/avis/${id}"
 
-    "${CURL[@]}" "${base}/json/" -o "${RAW_DIR}/cert-fr/${id}.json" 2>/dev/null \
-      && count=$((count + 1)) \
-      || warn "JSON indisponible pour ${id}"
+    if "${CURL[@]}" "${base}/json/" -o "${RAW_DIR}/cert-fr/${id}.json" 2>/dev/null; then
+      count=$((count + 1))
+    else
+      warn "JSON indisponible pour ${id}"
+    fi
 
     "${CURL[@]}" "${base}/" -o "${RAW_DIR}/cert-fr/${id}.html" 2>/dev/null \
       || warn "HTML indisponible pour ${id}"
@@ -70,9 +96,14 @@ fetch_cnil() {
   for url in "${urls[@]}"; do
     local name
     name="$(basename "${url}")"
-    "${CURL[@]}" "${url}" -o "${RAW_DIR}/cnil/${name}" 2>/dev/null \
-      && count=$((count + 1)) \
-      || warn "PDF indisponible : ${url}"
+    local out="${RAW_DIR}/cnil/${name}"
+
+    if "${CURL[@]}" "${url}" -o "${out}" 2>/dev/null && is_valid_file "${out}"; then
+      count=$((count + 1))
+    else
+      warn "PDF invalide ou indisponible : ${url}"
+      rm -f "${out}"
+    fi
   done
 
   log "CNIL : ${count} guides recuperes dans corpus/raw/cnil/"
@@ -81,7 +112,7 @@ fetch_cnil() {
 fetch_open() {
   log "data.gouv.fr : recherche de jeux de donnees..."
   local query="${DATA_QUERY:-intelligence artificielle}"
-  local api="https://www.data.gouv.fr/api/1/datasets/?page_size=5&q=${query// /%20}"
+  local api="https://www.data.gouv.fr/api/1/datasets/?page_size=10&q=${query// /%20}"
   local meta
   meta="$(mktemp)"
 
@@ -92,7 +123,7 @@ fetch_open() {
   fi
 
   local urls
-  urls="$(grep -oE 'https://[^" ]+\.(pdf|csv|json|txt)' "${meta}" | sort -u | head -n 5)"
+  urls="$(grep -oE 'https://[^" ]+\.(pdf|csv|json|txt)' "${meta}" | sort -u | head -n 10)"
   rm -f "${meta}"
 
   local count=0
@@ -101,12 +132,22 @@ fetch_open() {
     name="$(basename "${url}" | tr -cd 'A-Za-z0-9._-')"
     [ -z "${name}" ] && name="resource_${count}.bin"
 
-    "${CURL[@]}" "${url}" -o "${RAW_DIR}/data-gouv/${name}" 2>/dev/null \
-      && count=$((count + 1)) \
-      || warn "Ressource indisponible : ${url}"
+    local out="${RAW_DIR}/data-gouv/${name}"
+
+    if "${CURL[@]}" "${url}" -o "${out}" 2>/dev/null && is_valid_file "${out}"; then
+      count=$((count + 1))
+      log "OK : ${name}"
+    else
+      warn "Ressource invalide ignoree : ${url}"
+      rm -f "${out}"
+    fi
+
+    if [ "${count}" -ge 5 ]; then
+      break
+    fi
   done
 
-  log "data.gouv : ${count} ressources recuperees dans corpus/raw/data-gouv/"
+  log "data.gouv : ${count} ressources valides recuperees dans corpus/raw/data-gouv/"
 }
 
 case "${PROFILE}" in
